@@ -1,0 +1,29 @@
+# Large graph files (too big for GitHub)
+data/graph/*.txt
+
+# Training logs (can be regenerated)
+training_log_*.txt
+results_*_training.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
