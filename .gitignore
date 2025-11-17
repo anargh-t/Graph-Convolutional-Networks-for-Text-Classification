@@ -1,9 +1,15 @@
+# Experiment artifacts
+experiments/*/logs/
+experiments/*/results/
 # Large graph files (too big for GitHub)
 data/graph/*.txt
+data/graph/*.pkl
+data/graph/*.csv
 
 # Training logs (can be regenerated)
 training_log_*.txt
 results_*_training.txt
+results/
 
 # Python cache
 __pycache__/

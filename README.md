@@ -1,22 +1,20 @@
-# Graph Convolutional Networks for Text Classification in PyTorch
+# Topic Graph Convolutional Networks (TopicGCN)
 
-PyTorch implementation of Graph Convolutional Networks for Text Classification [1].
+TopicGCN replaces the classic TextGCN document-word graph with a **document-topic-topic** heterogeneous graph.  
+Key ideas:
+- Build topics with LDA and connect documents to topics via θ<sub>d,k</sub>
+- Embed topics via the average Word2Vec representation of their top words
+- Connect topics via cosine similarity to capture semantic proximity
+- Train a two-layer GCN on this compact, interpretable graph
 
-Tested on the 20NG/R8/R52/Ohsumed/MR data set, the code on this repository can achieve the effect of the paper.
+## Current Benchmark
 
-## Benchmark
+| Dataset | Accuracy | Notes |
+|---------|----------|-------|
+| R8      | **94.11%** | TopicGCN (single run, 50 topics) |
 
-| dataset       | 20NG | R8 | R52 | Ohsumed | MR  |
-|---------------|----------|------|--------|--------|--------|
-| TextGCN(official) | 0.8634    | 0.9759 | 0.9356   | 0.6836   | 0.7674   |
-| This repo.    | **0.8646**     | **0.9708** | 0.9354   | 0.6827  | **0.7594**  |
-
-### Latest Results (Single Run)
-- **20NG**: 86.46% accuracy (vs paper: 86.34%) - **+0.12% improvement**
-- **R8**: 97.08% accuracy (vs paper: 97.59%) - **-0.51% difference**
-- **MR**: 75.94% accuracy (vs paper: 76.74%) - **-0.80% difference**
-
-NOTE: The original benchmark results are from 10 runs averaged. Our latest single-run results show excellent performance matching the paper benchmarks.
+> To reproduce the result, run `python build_graph.py --dataset R8 --num_topics 50` followed by  
+> `python trainer.py --dataset R8 --times 1`.
 
 ## Requirements
 
@@ -64,45 +62,55 @@ pip install prettytable  # Additional dependency
 
 ## Usage
 
-### Quick Start (20NG dataset)
+### 1. (Optional) Clean raw corpora
 ```bash
-# 1. Process the data (optional - already done)
-python data_processor.py
-
-# 2. Generate graph (optional - already done)
-python build_graph.py
-
-# 3. Train model on 20NG dataset
-python trainer.py
+python data_processor.py --dataset R8   # or 20ng / mr / ...
 ```
+Pre-cleaned files already exist under `data/text_dataset/clean_corpus/`.
 
-### Running Different Datasets
+### 2. Build Document-Topic-Topic graph
+```bash
+# Build a graph for a single dataset
+python build_graph.py --dataset R8 --num_topics 50
 
-To run on different datasets, modify the `main()` call in `trainer.py`:
-
-```python
-# For MR dataset
-main("mr", 1)
-
-# For R8 dataset  
-main("R8", 1)
-
-# For R52 dataset
-main("R52", 1)
-
-# For Ohsumed dataset
-main("ohsumed", 1)
-
-# For 20NG dataset (default)
-main("20ng", 1)
+# Build graphs for all supported datasets with custom thresholds
+python build_graph.py --num_topics 70 \
+    --doc_topic_threshold 0.015 \
+    --topic_topic_threshold 0.35
 ```
+Artifacts are saved in `data/graph/`:
+- `R8_topic.txt` – weighted edge list
+- `R8_topic_model.pkl` – serialized LDA + embeddings
+- `R8_topic_nodes.csv` – Protégé-compatible node definitions
+- `R8_topic_edges.csv` – Protégé-compatible edge definitions
 
-### Custom Processing
+See [TOPIC_GCN_GUIDE.md](TOPIC_GCN_GUIDE.md#6-visualizing-graphs-in-protégé) for instructions on visualizing graphs in Protégé.
 
-If you need to reprocess data or build graphs for specific datasets:
+### 3. Train TopicGCN
+```bash
+# Train a single run
+python trainer.py --dataset R8 --times 1
 
-1. **Data Processing**: Edit `data_processor.py` main() function to specify your dataset
-2. **Graph Building**: Edit `build_graph.py` main() function to specify your dataset
+# Average across multiple random seeds
+python trainer.py --dataset 20ng --times 5
+```
+Training automatically logs detailed metrics to  
+`results/<dataset>_topic_training_results.txt`.
+
+### 4. Reproducible experiments (recommended for publications)
+```bash
+# Edit the YAML to tweak hyperparameters
+python run_experiment.py --config experiments/r8.yaml
+```
+This orchestrator builds the graph, trains TopicGCN, runs topic inspection, and stores all artifacts under `experiments/<dataset>/`.
+
+### 5. Inspect topics (optional but recommended)
+```bash
+python inspect_topics.py --dataset R8 \
+    --top_n_words 20 \
+    --top_n_docs 3
+```
+This prints topic summaries and saves them to `results/<dataset>_topic_inspection.txt`.
 
 ## Project Structure
 
@@ -110,34 +118,20 @@ If you need to reprocess data or build graphs for specific datasets:
 ├── data/
 │   ├── graph/              # Generated graph files
 │   └── text_dataset/      # Text datasets and processed corpora
-├── build_graph.py         # Graph construction (TF-IDF + PMI edges)
+├── experiments/           # YAML configs + generated logs/results
+├── build_graph.py         # Document-topic graph construction
+├── trainer.py             # TopicGCN training script
+├── run_experiment.py      # Pipeline orchestrator
+├── topic_model.py         # LDA + topic embedding utilities
+├── inspect_topics.py      # Topic visualization helpers
 ├── data_processor.py      # Text preprocessing and cleaning
-├── trainer.py             # Main training script
 ├── layer.py               # GCN model definition
 ├── utils.py               # Utility functions
 └── requirements.txt       # Dependencies
 ```
 
-## Recent Updates
+## Useful References
+- [Graph Convolutional Networks for Text Classification](https://arxiv.org/abs/1809.05679)
+- [Latent Dirichlet Allocation](https://jmlr.org/papers/v3/blei03a.html)
 
-### Compatibility Fixes
-- Fixed NetworkX compatibility issues (`to_scipy_sparse_matrix` → `adjacency_matrix`)
-- Fixed NumPy compatibility issues (`np.float` → `np.float32` for memory efficiency)
-- Fixed scikit-learn compatibility issues (`get_feature_names` → `get_feature_names_out`)
-- Fixed Unicode encoding issues in print statements
-- Added missing `prettytable` dependency
-
-### Latest Training Results (2024)
-- **20NG Dataset**: Achieved 86.46% accuracy (exceeding paper's 86.34%)
-- **R8 Dataset**: Achieved 97.08% accuracy (very close to paper's 97.59%)
-- **MR Dataset**: Achieved 75.94% accuracy (close to paper's 76.74%)
-- Added comprehensive result logs: `results_20ng_training.txt`, `results_r8_training.txt`
-- Optimized memory usage with `float32` precision for large datasets
-
-### Result Files
-- `results_20ng_training.txt`: Complete 20NG training log with 86.46% accuracy
-- `results_r8_training.txt`: Complete R8 training log with 97.08% accuracy
-- `training_log_MR.txt`: MR dataset training log with 75.94% accuracy
-
-## References
-[1] [Yao, L. , Mao, C. , & Luo, Y. . (2018). Graph convolutional networks for text classification.](https://arxiv.org/abs/1809.05679)
+See `TOPIC_GCN_GUIDE.md` for a deeper dive into hyperparameters, thresholds, and troubleshooting tips.

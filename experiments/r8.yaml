@@ -1,0 +1,18 @@
+dataset: R8
+
+build:
+  num_topics: 50
+  doc_topic_threshold: 0.02
+  topic_topic_threshold: 0.30
+  min_df: 2
+  max_df: 0.95
+  use_word2vec: true
+
+train:
+  times: 1
+
+inspect:
+  top_n_words: 20
+  top_n_docs: 5
+  heatmap: true
+

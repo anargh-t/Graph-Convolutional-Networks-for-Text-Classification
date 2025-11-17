@@ -1,13 +1,13 @@
 """
-TextGCN Training Script
+TopicGCN Training Script
 
-This script implements the training pipeline for Graph Convolutional Networks
-for Text Classification. It loads preprocessed graphs, trains GCN models,
-and evaluates performance on text classification tasks.
+This script implements the training pipeline for Topic-aware Graph
+Convolutional Networks. It loads the document-topic graph, builds topic-based
+features, trains the GCN model, and evaluates performance.
 
 Main components:
-- PrepareData: Loads and preprocesses graph data
-- TextGCNTrainer: Handles model training and evaluation
+- PrepareData: Loads graph data, features, and labels
+- TopicGCNTrainer: Handles model training and evaluation
 - Main function: Orchestrates the training process
 """
 
@@ -28,7 +28,6 @@ from utils import macro_f1
 from utils import CudaUse
 from utils import EarlyStopping
 from utils import LogResult
-from utils import parameter_parser
 from utils import preprocess_adj
 from utils import print_graph_detail
 from utils import read_file
@@ -74,11 +73,11 @@ def get_train_test(target_fn):
 
 class PrepareData:
     """
-    Data preparation class for TextGCN training.
+    Data preparation class for TopicGCN training.
     
-    This class handles loading and preprocessing of graph data, features,
-    and labels for the TextGCN model. It creates the necessary data structures
-    for training including adjacency matrices, feature matrices, and label vectors.
+    This class loads the pre-built document-topic graph, constructs the adjacency
+    matrix, builds topic-aware node features, and prepares labels/splits for the
+    GCN model.
     """
     
     def __init__(self, args):
@@ -86,16 +85,17 @@ class PrepareData:
         Initialize data preparation.
         
         Args:
-            args: Command line arguments containing dataset name and other parameters
+            args: Namespace containing dataset name and training hyperparameters.
         """
         print("prepare data")
         self.graph_path = "data/graph"
         self.args = args
+        
+        graph_filename = f"{self.graph_path}/{args.dataset}_topic.txt"
+        print(f"Loading TopicGCN graph: {graph_filename}")
 
         # Load the pre-built graph from file
-        # The graph contains document-word and word-word edges with weights
-        graph = nx.read_weighted_edgelist(f"{self.graph_path}/{args.dataset}.txt"
-                                          , nodetype=int)
+        graph = nx.read_weighted_edgelist(graph_filename, nodetype=int)
         print_graph_detail(graph)
         try:
             # Try the old method first
@@ -151,28 +151,94 @@ class PrepareData:
         self.adj = preprocess_adj(adj, is_sparse=True)
 
         # ========== FEATURE MATRIX CONSTRUCTION ==========
+        self._build_topic_features(graph)
+    
+    def _build_topic_features(self, graph):
+        """
+        Build feature matrix for TopicGCN mode.
         
-        # In TextGCN, we use identity matrix as features
-        # Each node (document or word) has a unique one-hot feature vector
-        # This is a common approach in graph neural networks when no additional features are available
-        self.nfeat_dim = graph.number_of_nodes()
+        Document nodes: Use topic distribution vector θ_d (dimension K)
+        Topic nodes: Use topic embedding vector (dimension = embedding size)
+        """
+        from topic_model import TopicModel
         
-        # Create identity matrix as sparse tensor
-        # Row indices: [0, 1, 2, ..., n-1]
-        row = list(range(self.nfeat_dim))
-        # Column indices: [0, 1, 2, ..., n-1] (same as row for identity matrix)
-        col = list(range(self.nfeat_dim))
-        # Values: all 1.0 (diagonal elements)
-        value = [1.] * self.nfeat_dim
-        shape = (self.nfeat_dim, self.nfeat_dim)
+        print("\n==> Building topic-based features <==")
         
-        # Convert to PyTorch sparse tensor format
-        indices = th.from_numpy(
-                np.vstack((row, col)).astype(np.int64))
-        values = th.FloatTensor(value)
-        shape = th.Size(shape)
-
+        # Load topic model
+        topic_model_path = f"{self.graph_path}/{self.args.dataset}_topic_model.pkl"
+        topic_model = TopicModel(num_topics=getattr(self.args, 'num_topics', 50))
+        topic_model.load(topic_model_path)
+        
+        num_topics = topic_model.num_topics
+        
+        # Get document-topic distribution
+        clean_corpus_path = "data/text_dataset/clean_corpus"
+        content_path = f"{clean_corpus_path}/{self.args.dataset}.txt"
+        from topic_model import load_documents_from_file
+        documents = load_documents_from_file(content_path)
+        doc_topic_dist = topic_model.get_document_topic_distribution(documents)
+        
+        # Get topic embeddings
+        if topic_model.topic_embeddings is None:
+            topic_model.get_topic_embeddings(top_n=20)
+        topic_embeddings = topic_model.topic_embeddings
+        
+        num_docs = doc_topic_dist.shape[0]
+        embedding_dim = topic_embeddings.shape[1]
+        
+        print(f"Number of documents: {num_docs}")
+        print(f"Number of topics: {num_topics}")
+        print(f"Topic embedding dimension: {embedding_dim}")
+        
+        # Determine feature dimension
+        # For documents: use topic distribution (K dimensions)
+        # For topics: use embeddings (embedding_dim dimensions)
+        # We'll pad to the maximum dimension for compatibility
+        self.nfeat_dim = max(num_topics, embedding_dim)
+        
+        # Build feature matrix
+        # Documents: [0, num_docs-1] -> topic distributions
+        # Topics: [num_docs, num_docs+num_topics-1] -> embeddings
+        feature_matrix = np.zeros((num_docs + num_topics, self.nfeat_dim), dtype=np.float32)
+        
+        # Document features: topic distributions (normalized to sum to 1)
+        for doc_idx in range(num_docs):
+            topic_dist = doc_topic_dist[doc_idx]
+            # Normalize to ensure sum = 1
+            topic_dist = topic_dist / (topic_dist.sum() + 1e-8)
+            feature_matrix[doc_idx, :num_topics] = topic_dist
+        
+        # Topic features: embeddings
+        for topic_idx in range(num_topics):
+            if embedding_dim <= self.nfeat_dim:
+                feature_matrix[num_docs + topic_idx, :embedding_dim] = topic_embeddings[topic_idx]
+            else:
+                # If embedding is larger, truncate
+                feature_matrix[num_docs + topic_idx, :] = topic_embeddings[topic_idx, :self.nfeat_dim]
+        
+        # Normalize features (L2 normalization)
+        from sklearn.preprocessing import normalize
+        feature_matrix = normalize(feature_matrix, norm='l2', axis=1)
+        
+        # Convert to PyTorch sparse tensor
+        # For efficiency, convert dense to sparse
+        import scipy.sparse as sp
+        feature_sparse = sp.csr_matrix(feature_matrix)
+        
+        # Convert to COO format to get row and col indices
+        feature_coo = feature_sparse.tocoo()
+        row = feature_coo.row
+        col = feature_coo.col
+        data = feature_coo.data
+        
+        indices = th.from_numpy(np.vstack((row, col)).astype(np.int64))
+        values = th.FloatTensor(data)
+        shape = th.Size(feature_matrix.shape)
+        
         self.features = th.sparse.FloatTensor(indices, values, shape)
+        
+        print(f"Feature matrix shape: {self.features.shape}")
+        print(f"Feature dimension: {self.nfeat_dim}")
 
         # ========== LABEL PROCESSING ==========
         
@@ -195,18 +261,18 @@ class PrepareData:
         self.train_lst, self.test_lst = get_train_test(target_fn)
 
 
-class TextGCNTrainer:
+class TopicGCNTrainer:
     """
-    TextGCN Model Training and Evaluation Class
+    TopicGCN Model Training and Evaluation Class
     
-    This class handles the complete training pipeline for the TextGCN model,
+    This class handles the complete training pipeline for the TopicGCN model,
     including model initialization, training loop, validation, and testing.
     It implements early stopping, logging, and performance evaluation.
     """
     
     def __init__(self, args, model, pre_data):
         """
-        Initialize the TextGCN trainer.
+        Initialize the TopicGCN trainer.
         
         Args:
             args: Command line arguments with hyperparameters
@@ -281,6 +347,9 @@ class TextGCNTrainer:
         self.val_lst = th.tensor(self.val_lst).long().to(self.device)
 
     def train(self):
+        # Store training history for saving
+        self.training_history = []
+        
         for epoch in range(self.max_epoch):
             self.model.train()
             self.optimizer.zero_grad()
@@ -299,6 +368,9 @@ class TextGCNTrainer:
                            }, **val_desc)
 
             self.set_description(desc)
+            
+            # Store epoch results
+            self.training_history.append(desc)
 
             if self.earlystopping(val_desc["val_loss"]):
                 break
@@ -334,9 +406,21 @@ class TextGCNTrainer:
         return test_desc
 
 
-def main(dataset, times):
-    args = parameter_parser()
+def main(dataset, times, output_dir="results"):
+    """
+    Main training function.
+    
+    Args:
+        dataset: Dataset name
+        times: Number of training runs
+        output_dir: Directory to write structured outputs/logs
+    """
+    # Create args namespace for downstream components
+    class Args:
+        pass
+    args = Args()
     args.dataset = dataset
+    args.output_dir = output_dir
 
     args.device = th.device('cuda') if th.cuda.is_available() else th.device('cpu')
     args.nhid = 200
@@ -347,26 +431,39 @@ def main(dataset, times):
     args.lr = 0.02
     model = GCN
 
-    print(args)
+    print(vars(args))
+    print("\n==> Training in TopicGCN mode <==")
 
     predata = PrepareData(args)
     cudause = CudaUse()
 
     record = LogResult()
     seed_lst = list()
+    all_training_histories = []  # Store all training histories
+    
     for ind, seed in enumerate(return_seed(times)):
         print(f"\n\n==> {ind}, seed:{seed}")
         args.seed = seed
         seed_lst.append(seed)
 
-        framework = TextGCNTrainer(model=model, args=args, pre_data=predata)
+        framework = TopicGCNTrainer(model=model, args=args, pre_data=predata)
         framework.fit()
+        
+        # Evaluate once per run
+        test_results = framework.test()
+        
+        # Store training history
+        all_training_histories.append({
+            'seed': seed,
+            'history': framework.training_history,
+            'test_results': test_results
+        })
 
         if th.cuda.is_available():
             gpu_mem = cudause.gpu_mem_get(_id=0)
             record.log_single(key="gpu_mem", value=gpu_mem)
 
-        record.log(framework.test())
+        record.log(test_results)
 
         del framework
         gc.collect()
@@ -377,13 +474,135 @@ def main(dataset, times):
     print("==> seed set:")
     print(seed_lst)
     record.show_str()
+    
+    # Save results to file(s)
+    import os
+    import json
+    results_dir = output_dir
+    if not os.path.exists(results_dir):
+        os.makedirs(results_dir)
+    
+    mode_suffix = "_topic"
+    results_file = f"{results_dir}/{dataset}{mode_suffix}_training_results.txt"
+    
+    with open(results_file, 'w', encoding='utf-8') as f:
+        f.write("="*80 + "\n")
+        f.write(f"TRAINING RESULTS: {dataset.upper()}{mode_suffix.upper()}\n")
+        f.write("="*80 + "\n\n")
+        
+        f.write(f"Dataset: {dataset}\n")
+        f.write("Mode: TopicGCN\n")
+        f.write(f"Number of runs: {times}\n")
+        f.write(f"Seeds used: {seed_lst}\n\n")
+        
+        f.write("Hyperparameters:\n")
+        f.write(f"  Hidden dimension: {args.nhid}\n")
+        f.write(f"  Max epochs: {args.max_epoch}\n")
+        f.write(f"  Dropout: {args.dropout}\n")
+        f.write(f"  Learning rate: {args.lr}\n")
+        f.write(f"  Validation ratio: {args.val_ratio}\n")
+        f.write(f"  Early stopping patience: {args.early_stopping}\n\n")
+        
+        f.write("Results Summary:\n")
+        f.write("-"*80 + "\n")
+        for key, value_lst in record.result.items():
+            if key == 'train_time':
+                value = np.mean(value_lst)
+                f.write(f"{key}:\n")
+                f.write(f"  Mean: {value:.4f} seconds\n")
+                f.write(f"  Max: {max(value_lst):.4f} seconds\n")
+                f.write(f"  Min: {min(value_lst):.4f} seconds\n\n")
+            elif key == 'model_param':
+                value = np.mean(value_lst)
+                f.write(f"{key}:\n")
+                f.write(f"  Mean: {int(value)}\n")
+                f.write(f"  Max: {int(max(value_lst))}\n")
+                f.write(f"  Min: {int(min(value_lst))}\n\n")
+            else:
+                value = np.mean(value_lst)
+                f.write(f"{key}:\n")
+                f.write(f"  Mean: {value:.4f}\n")
+                f.write(f"  Max: {max(value_lst):.4f}\n")
+                f.write(f"  Min: {min(value_lst):.4f}\n\n")
+        
+        # Write detailed training history for each run
+        f.write("\n" + "="*80 + "\n")
+        f.write("DETAILED TRAINING HISTORY\n")
+        f.write("="*80 + "\n\n")
+        
+        for run_idx, run_data in enumerate(all_training_histories):
+            f.write(f"\nRun {run_idx + 1} (Seed: {run_data['seed']}):\n")
+            f.write("-"*80 + "\n")
+            f.write(f"{'Epoch':<8} {'Train Loss':<12} {'Val Loss':<12} {'Val Acc':<10} {'Val F1':<10} {'Val Prec':<10} {'Val Rec':<10}\n")
+            f.write("-"*80 + "\n")
+            
+            for epoch_data in run_data['history']:
+                epoch = epoch_data.get('epoch', 0)
+                train_loss = epoch_data.get('train_loss', 0)
+                val_loss = epoch_data.get('val_loss', 0)
+                val_acc = epoch_data.get('acc', 0)
+                val_f1 = epoch_data.get('macro_f1', 0)
+                val_prec = epoch_data.get('precision', 0)
+                val_rec = epoch_data.get('recall', 0)
+                
+                f.write(f"{epoch:<8} {train_loss:<12.4f} {val_loss:<12.4f} {val_acc:<10.4f} "
+                       f"{val_f1:<10.4f} {val_prec:<10.4f} {val_rec:<10.4f}\n")
+            
+            # Write test results
+            test_res = run_data['test_results']
+            f.write("\nTest Results:\n")
+            f.write(f"  Test Loss: {test_res.get('test_loss', 0):.4f}\n")
+            f.write(f"  Test Accuracy: {test_res.get('acc', 0):.4f}\n")
+            f.write(f"  Test Macro F1: {test_res.get('macro_f1', 0):.4f}\n")
+            f.write(f"  Test Precision: {test_res.get('precision', 0):.4f}\n")
+            f.write(f"  Test Recall: {test_res.get('recall', 0):.4f}\n")
+            f.write(f"  Training Time: {test_res.get('train_time', 0):.2f} seconds\n")
+            f.write(f"  Model Parameters: {test_res.get('model_param', 0)}\n")
+            f.write("\n")
+        
+        f.write("="*80 + "\n")
+    
+    print(f"\nResults saved to: {results_file}")
+    
+    # Save structured summary as JSON
+    summary = {
+        "dataset": dataset,
+        "mode": "TopicGCN",
+        "runs": times,
+        "seeds": seed_lst,
+        "hyperparams": {
+            "hidden_dim": args.nhid,
+            "max_epoch": args.max_epoch,
+            "dropout": args.dropout,
+            "learning_rate": args.lr,
+            "val_ratio": args.val_ratio,
+            "early_stopping": args.early_stopping,
+        },
+        "metrics": {
+            key: {
+                "mean": float(np.mean(vals)),
+                "max": float(np.max(vals)),
+                "min": float(np.min(vals)),
+            } for key, vals in record.result.items()
+        },
+        "runs_detail": all_training_histories,
+    }
+    json_path = f"{results_dir}/{dataset}{mode_suffix}_training_results.json"
+    with open(json_path, "w", encoding="utf-8") as jf:
+        json.dump(summary, jf, indent=2)
+    print(f"Structured summary saved to: {json_path}")
 
 
 if __name__ == '__main__':
-    # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
-    # for d in ["mr", "ohsumed", "R52", "R8", "20ng"]:
-    #     main(d)
-    main("R8", 1)  # Run R8 dataset
-    # main("ohsumed")
-    # main("R8", 1)
-    # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train TopicGCN")
+    parser.add_argument('--dataset', type=str, default='R8',
+                       help='Dataset name (default: R8)')
+    parser.add_argument('--times', type=int, default=1,
+                       help='Number of training runs (default: 1)')
+    parser.add_argument('--output_dir', type=str, default='results',
+                       help='Directory to save training artifacts (default: results)')
+    
+    args = parser.parse_args()
+    main(args.dataset, args.times, output_dir=args.output_dir)

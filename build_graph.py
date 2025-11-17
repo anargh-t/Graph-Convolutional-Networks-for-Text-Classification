@@ -1,346 +1,265 @@
 """
-TextGCN Graph Construction Script
+TopicGCN Graph Construction Script
 
-This script builds the heterogeneous graph for TextGCN by creating two types of edges:
-1. Document-Word edges: Based on TF-IDF weights
-2. Word-Word edges: Based on PMI (Pointwise Mutual Information) scores
+This script builds a Document-Topic-Topic graph for TopicGCN. The graph
+contains:
+- Document nodes: indices [0, num_docs)
+- Topic nodes: indices [num_docs, num_docs + num_topics)
+- Document-topic edges with weights from the LDA topic distribution (θ_dk)
+- Topic-topic edges with weights given by cosine similarity of topic embeddings
 
-The graph construction process:
-1. Load cleaned text corpus
-2. Compute TF-IDF features for document-word relationships
-3. Compute PMI scores for word-word co-occurrence relationships
-4. Build NetworkX graph with weighted edges
-5. Save graph to file for training
-
-Key concepts:
-- TF-IDF: Term Frequency-Inverse Document Frequency for document-word weights
-- PMI: Pointwise Mutual Information for word co-occurrence relationships
-- Window-based co-occurrence: Words appearing within a sliding window are considered related
+The workflow:
+1. Load the cleaned corpus for the target dataset
+2. Fit an LDA topic model (optionally train Word2Vec for embeddings)
+3. Create document-topic edges filtered by θ_dk threshold
+4. Create topic-topic edges filtered by cosine similarity threshold
+5. Save the resulting weighted graph and the trained topic model
 """
 
 import os
-from collections import Counter
+from typing import List, Optional
 
 import networkx as nx
-
-import itertools
-import math
-from collections import defaultdict
-from time import time
-
-from sklearn.feature_extraction.text import CountVectorizer
-from sklearn.feature_extraction.text import TfidfTransformer
-from sklearn.pipeline import Pipeline
+from sklearn.metrics.pairwise import cosine_similarity
 from tqdm import tqdm
 
+from topic_model import TopicModel, load_documents_from_file
 from utils import print_graph_detail
 
 
-def get_window(content_lst, window_size):
+class TopicGraphBuilder:
     """
-    Extract sliding windows from text documents for PMI calculation.
-    
-    This function processes each document and creates sliding windows of words
-    to capture local co-occurrence patterns. Words appearing in the same window
-    are considered to be related.
-    
+    Build a Document-Topic-Topic graph for a specific dataset.
+
     Args:
-        content_lst: List of documents (each document is a string or list of words)
-        window_size: Size of the sliding window for co-occurrence detection
-        
-    Returns:
-        tuple: (word_window_freq, word_pair_count, windows_len)
-            - word_window_freq: Dictionary of word frequencies across all windows
-            - word_pair_count: Dictionary of word pair co-occurrence counts
-            - windows_len: Total number of windows processed
+        dataset: Dataset name (e.g., "mr", "20ng", "R8")
+        num_topics: Number of topics (K) for LDA
+        doc_topic_threshold: Minimum θ_dk to keep a document-topic edge
+        topic_topic_threshold: Minimum cosine similarity to keep a topic-topic edge
+        use_word2vec: Whether to train Word2Vec for topic embeddings
+        min_df: Minimum document frequency for LDA vocabulary
+        max_df: Maximum document frequency (fraction) for LDA vocabulary
     """
-    # Track word frequencies within windows
-    word_window_freq = defaultdict(int)  # w(i): word frequency in windows
-    # Track word pair co-occurrence counts
-    word_pair_count = defaultdict(int)  # w(i,j): word pair co-occurrence count
-    windows_len = 0
-    
-    # Process each document
-    for words in tqdm(content_lst, desc="Split by window"):
-        windows = list()
 
-        # Convert string to word list if needed
-        if isinstance(words, str):
-            words = words.split()
-        length = len(words)
-
-        # Create windows based on document length
-        if length <= window_size:
-            # If document is shorter than window, use entire document as one window
-            windows.append(words)
-        else:
-            # Create sliding windows of specified size
-            for j in range(length - window_size + 1):
-                window = words[j: j + window_size]
-                # Remove duplicates within each window
-                windows.append(list(set(window)))
-
-        # Process each window
-        for window in windows:
-            # Count word frequencies in this window
-            for word in window:
-                word_window_freq[word] += 1
-
-            # Count word pair co-occurrences in this window
-            for word_pair in itertools.combinations(window, 2):
-                word_pair_count[word_pair] += 1
-
-        windows_len += len(windows)
-        
-    return word_window_freq, word_pair_count, windows_len
-
-
-def cal_pmi(W_ij, W, word_freq_1, word_freq_2):
-    """
-    Calculate Pointwise Mutual Information (PMI) between two words.
-    
-    PMI measures the association between two words based on their co-occurrence
-    frequency compared to their individual frequencies. Higher PMI indicates
-    stronger association between words.
-    
-    Formula: PMI(i,j) = log(P(i,j) / (P(i) * P(j)))
-    Where:
-    - P(i,j) = W_ij / W (joint probability)
-    - P(i) = word_freq_1 / W (marginal probability of word i)
-    - P(j) = word_freq_2 / W (marginal probability of word j)
-    
-    Args:
-        W_ij: Co-occurrence count of word pair (i,j)
-        W: Total number of windows
-        word_freq_1: Frequency of word i across all windows
-        word_freq_2: Frequency of word j across all windows
-        
-    Returns:
-        float: PMI score between the two words
-    """
-    # Calculate marginal probabilities
-    p_i = word_freq_1 / W  # Probability of word i appearing in a window
-    p_j = word_freq_2 / W  # Probability of word j appearing in a window
-    p_i_j = W_ij / W       # Joint probability of words i and j appearing together
-    
-    # Calculate PMI: log(P(i,j) / (P(i) * P(j)))
-    pmi = math.log(p_i_j / (p_i * p_j))
-
-    return pmi
-
-
-def count_pmi(windows_len, word_pair_count, word_window_freq, threshold):
-    """
-    Calculate PMI scores for all word pairs and filter by threshold.
-    
-    This function processes all word pairs that co-occurred in windows,
-    calculates their PMI scores, and keeps only those above the threshold.
-    This filtering helps remove weak associations and reduces graph sparsity.
-    
-    Args:
-        windows_len: Total number of windows processed
-        word_pair_count: Dictionary of word pair co-occurrence counts
-        word_window_freq: Dictionary of individual word frequencies
-        threshold: Minimum PMI threshold for keeping word pairs
-        
-    Returns:
-        list: List of [word1, word2, pmi_score] tuples for word pairs above threshold
-    """
-    word_pmi_lst = list()
-    
-    # Process each word pair that co-occurred
-    for word_pair, W_i_j in tqdm(word_pair_count.items(), desc="Calculate pmi between words"):
-        # Get individual word frequencies
-        word_freq_1 = word_window_freq[word_pair[0]]
-        word_freq_2 = word_window_freq[word_pair[1]]
-
-        # Calculate PMI for this word pair
-        pmi = cal_pmi(W_i_j, windows_len, word_freq_1, word_freq_2)
-        
-        # Only keep word pairs with PMI above threshold
-        if pmi <= threshold:
-            continue
-            
-        # Add to result list: [word1, word2, pmi_score]
-        word_pmi_lst.append([word_pair[0], word_pair[1], pmi])
-        
-    return word_pmi_lst
-
-
-def get_pmi_edge(content_lst, window_size=20, threshold=0.):
-    """
-    Extract PMI-based word-word edges from text corpus.
-    
-    This function orchestrates the PMI calculation process:
-    1. Load text corpus
-    2. Extract sliding windows
-    3. Calculate PMI scores for word pairs
-    4. Return filtered word-word edges
-    
-    Args:
-        content_lst: List of documents or path to text file
-        window_size: Size of sliding window for co-occurrence detection
-        threshold: Minimum PMI threshold for keeping edges
-        
-    Returns:
-        tuple: (pmi_edge_lst, pmi_time)
-            - pmi_edge_lst: List of [word1, word2, pmi_score] edges
-            - pmi_time: Time taken for PMI calculation
-    """
-    # Handle file path input
-    if isinstance(content_lst, str):
-        content_lst = list(open(content_lst, "r"))
-    print("pmi read file len:", len(content_lst))
-
-    # Start timing PMI calculation
-    pmi_start = time()
-    
-    # Extract sliding windows and count co-occurrences
-    word_window_freq, word_pair_count, windows_len = get_window(content_lst,
-                                                                window_size=window_size)
-
-    # Calculate PMI scores and filter by threshold
-    pmi_edge_lst = count_pmi(windows_len, word_pair_count, word_window_freq, threshold)
-    print("Total number of edges between word:", len(pmi_edge_lst))
-    
-    # Calculate total time
-    pmi_time = time() - pmi_start
-    return pmi_edge_lst, pmi_time
-
-
-class BuildGraph:
-    """
-    Main class for building TextGCN heterogeneous graph.
-    
-    This class orchestrates the complete graph construction process:
-    1. Creates document-word edges using TF-IDF weights
-    2. Creates word-word edges using PMI scores
-    3. Combines both types of edges into a single graph
-    4. Saves the graph to file for training
-    
-    The resulting graph contains:
-    - Document nodes (indices 0 to num_docs-1)
-    - Word nodes (indices num_docs to num_docs+num_words-1)
-    - Document-word edges with TF-IDF weights
-    - Word-word edges with PMI weights
-    """
-    
-    def __init__(self, dataset):
-        """
-        Initialize graph construction for a specific dataset.
-        
-        Args:
-            dataset (str): Name of the dataset (e.g., 'mr', '20ng', 'R8')
-        """
-        # Set up file paths
-        clean_corpus_path = "data/text_dataset/clean_corpus"
-        self.graph_path = "data/graph"
-        
-        # Create output directory if it doesn't exist
-        if not os.path.exists(self.graph_path):
-            os.makedirs(self.graph_path)
-
-        # Initialize word-to-ID mapping dictionary
-        self.word2id = dict()  # Maps words to their node indices
+    def __init__(
+        self,
+        dataset: str,
+        num_topics: int = 50,
+        doc_topic_threshold: float = 0.02,
+        topic_topic_threshold: float = 0.3,
+        use_word2vec: bool = True,
+        min_df: int = 2,
+        max_df: float = 0.95,
+    ):
         self.dataset = dataset
-        print(f"\n==> Current dataset: {dataset} <==")
+        self.num_topics = num_topics
+        self.doc_topic_threshold = doc_topic_threshold
+        self.topic_topic_threshold = topic_topic_threshold
+        self.use_word2vec = use_word2vec
+        self.min_df = min_df
+        self.max_df = max_df
 
-        # Initialize empty NetworkX graph
-        self.g = nx.Graph()
+        self.clean_corpus_path = "data/text_dataset/clean_corpus"
+        self.graph_path = "data/graph"
+        os.makedirs(self.graph_path, exist_ok=True)
 
-        # Set path to cleaned corpus file
-        self.content = f"{clean_corpus_path}/{dataset}.txt"
+        self.documents = load_documents_from_file(
+            os.path.join(self.clean_corpus_path, f"{dataset}.txt")
+        )
+        self.num_docs = len(self.documents)
 
-        # Build the graph by adding both types of edges
-        self.get_tfidf_edge()  # Add document-word edges
-        self.get_pmi_edge()    # Add word-word edges
-        self.save()            # Save graph to file
+        print(f"\n==> Building TopicGCN graph for dataset: {dataset} <==")
+        print(f"Documents: {self.num_docs}")
+        print(f"Topics: {num_topics}")
+        print(f"Document-topic threshold: {doc_topic_threshold}")
+        print(f"Topic-topic threshold: {topic_topic_threshold}")
 
-    def get_pmi_edge(self):
-        pmi_edge_lst, self.pmi_time = get_pmi_edge(self.content, window_size=20, threshold=0.0)
-        print("pmi time:", self.pmi_time)
+        self.graph = nx.Graph()
+        self.topic_model = TopicModel(num_topics=num_topics, random_state=42)
 
-        for edge_item in pmi_edge_lst:
-            word_indx1 = self.node_num + self.word2id[edge_item[0]]
-            word_indx2 = self.node_num + self.word2id[edge_item[1]]
-            if word_indx1 == word_indx2:
-                continue
-            self.g.add_edge(word_indx1, word_indx2, weight=edge_item[2])
+        self._build_topic_model()
+        self._add_document_topic_edges()
+        self._add_topic_topic_edges()
+        self._save_outputs()
+    
+    def _build_topic_model(self) -> None:
+        print("\n==> Fitting LDA model <==")
+        self.topic_model.fit(self.documents, min_df=self.min_df, max_df=self.max_df)
 
-        print_graph_detail(self.g)
+        if self.use_word2vec:
+            self.topic_model.fit_word2vec(self.documents, vector_size=100)
 
-    def get_tfidf_edge(self):
-        # 获得tfidf权重矩阵（sparse）和单词列表
-        tfidf_vec = self.get_tfidf_vec()
+        self.topic_model.get_topic_embeddings(top_n=20)
+        self.doc_topic_dist = self.topic_model.get_document_topic_distribution(self.documents)
+        self.topic_embeddings = self.topic_model.topic_embeddings
 
-        count_lst = list()  # 统计每个句子的长度
-        for ind, row in tqdm(enumerate(tfidf_vec),
-                             desc="generate tfidf edge"):
-            count = 0
-            for col_ind, value in zip(row.indices, row.data):
-                word_ind = self.node_num + col_ind
-                self.g.add_edge(ind, word_ind, weight=value)
-                count += 1
-            count_lst.append(count)
+        print(f"Document-topic matrix: {self.doc_topic_dist.shape}")
+        print(f"Topic embedding matrix: {self.topic_embeddings.shape}")
 
-        print_graph_detail(self.g)
+    def _add_document_topic_edges(self) -> None:
+        print("\n==> Adding document-topic edges <==")
+        edge_count = 0
 
-    def get_tfidf_vec(self):
+        for doc_idx in tqdm(range(self.num_docs), desc="Document-topic"):
+            for topic_idx in range(self.num_topics):
+                weight = self.doc_topic_dist[doc_idx, topic_idx]
+                if weight < self.doc_topic_threshold:
+                    continue
+
+                topic_node_idx = self.num_docs + topic_idx
+                self.graph.add_edge(doc_idx, topic_node_idx, weight=float(weight))
+                edge_count += 1
+
+        print(f"Document-topic edges: {edge_count}")
+        print_graph_detail(self.graph)
+
+    def _add_topic_topic_edges(self) -> None:
+        print("\n==> Adding topic-topic edges <==")
+        similarity_matrix = cosine_similarity(self.topic_embeddings)
+
+        edge_count = 0
+        for i in tqdm(range(self.num_topics), desc="Topic-topic"):
+            for j in range(i + 1, self.num_topics):
+                similarity = similarity_matrix[i, j]
+                if similarity <= self.topic_topic_threshold:
+                    continue
+
+                topic_i = self.num_docs + i
+                topic_j = self.num_docs + j
+                self.graph.add_edge(topic_i, topic_j, weight=float(similarity))
+                edge_count += 1
+
+        print(f"Topic-topic edges: {edge_count}")
+        print_graph_detail(self.graph)
+
+    def _export_protege_csvs(self) -> None:
         """
-        学习获得tfidf矩阵，及其对应的单词序列
-        :param content_lst:
-        :return:
+        Export nodes and edges as CSV files for Protégé visualization.
+        
+        Creates two files:
+        - {dataset}_topic_nodes.csv: node_id, node_type, label
+        - {dataset}_topic_edges.csv: source_id, target_id, edge_type, weight
         """
-        start = time()
-        text_tfidf = Pipeline([
-            ("vect", CountVectorizer(min_df=1,
-                                     max_df=1.0,
-                                     token_pattern=r"\S+",
-                                     )),
-            ("tfidf", TfidfTransformer(norm=None,
-                                       use_idf=True,
-                                       smooth_idf=False,
-                                       sublinear_tf=False
-                                       ))
-        ])
+        import csv
+        
+        nodes_file = os.path.join(self.graph_path, f"{self.dataset}_topic_nodes.csv")
+        edges_file = os.path.join(self.graph_path, f"{self.dataset}_topic_edges.csv")
+        
+        # Get topic words for labels
+        topic_words_dict = self.topic_model.get_topic_word_distribution(top_n=10)
+        
+        # Export nodes
+        with open(nodes_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['node_id', 'node_type', 'label'])
+            
+            # Document nodes
+            for doc_idx in range(self.num_docs):
+                # Create a short label from document (first 50 chars)
+                doc_label = self.documents[doc_idx][:50].replace('\n', ' ').replace(',', ' ')
+                if len(self.documents[doc_idx]) > 50:
+                    doc_label += '...'
+                writer.writerow([doc_idx, 'document', f'Doc_{doc_idx}: {doc_label}'])
+            
+            # Topic nodes
+            for topic_idx in range(self.num_topics):
+                topic_node_idx = self.num_docs + topic_idx
+                top_words = [word for word, _ in topic_words_dict[topic_idx][:5]]
+                topic_label = f'Topic_{topic_idx}: {", ".join(top_words)}'
+                writer.writerow([topic_node_idx, 'topic', topic_label])
+        
+        # Export edges
+        with open(edges_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['source_id', 'target_id', 'edge_type', 'weight'])
+            
+            for u, v, data in self.graph.edges(data=True):
+                weight = data.get('weight', 1.0)
+                
+                # Determine edge type
+                if u < self.num_docs and v >= self.num_docs:
+                    edge_type = 'doc-topic'
+                elif u >= self.num_docs and v < self.num_docs:
+                    edge_type = 'doc-topic'
+                elif u >= self.num_docs and v >= self.num_docs:
+                    edge_type = 'topic-topic'
+                else:
+                    edge_type = 'doc-doc'  # Should not happen in our graph
+                
+                writer.writerow([u, v, edge_type, f'{weight:.6f}'])
+        
+        print(f"Protégé CSV files exported:")
+        print(f"  Nodes: {nodes_file}")
+        print(f"  Edges: {edges_file}")
 
-        tfidf_vec = text_tfidf.fit_transform(open(self.content, "r"))
+    def _save_outputs(self) -> None:
+        graph_file = os.path.join(self.graph_path, f"{self.dataset}_topic.txt")
+        model_file = os.path.join(self.graph_path, f"{self.dataset}_topic_model.pkl")
 
-        self.tfidf_time = time() - start
-        print("tfidf time:", self.tfidf_time)
-        print("tfidf_vec shape:", tfidf_vec.shape)
-        print("tfidf_vec type:", type(tfidf_vec))
+        nx.write_weighted_edgelist(self.graph, graph_file)
+        self.topic_model.save(model_file)
+        self._export_protege_csvs()
 
-        self.node_num = tfidf_vec.shape[0]
+        print(f"\nGraph saved to: {graph_file}")
+        print(f"Topic model saved to: {model_file}")
+        print(f"Total nodes: {self.graph.number_of_nodes()}")
+        print(f"Total edges: {self.graph.number_of_edges()}\n")
 
-        # Map words
+
+def build_graphs(
+    datasets: Optional[List[str]] = None,
+    num_topics: int = 50,
+    doc_topic_threshold: float = 0.02,
+    topic_topic_threshold: float = 0.3,
+    use_word2vec: bool = True,
+    min_df: int = 2,
+    max_df: float = 0.95,
+) -> None:
+    target_datasets = datasets or ["mr", "ohsumed", "R52", "R8", "20ng"]
+
+    for dataset in target_datasets:
         try:
-            vocab_lst = text_tfidf["vect"].get_feature_names_out()
-        except AttributeError:
-            vocab_lst = text_tfidf["vect"].get_feature_names()
-        print("vocab_lst len:", len(vocab_lst))
-        for ind, word in enumerate(vocab_lst):
-            self.word2id[word] = ind
-
-        self.vocab_lst = vocab_lst
-
-        return tfidf_vec
-
-    def save(self):
-        print("total time:", self.pmi_time + self.tfidf_time)
-        nx.write_weighted_edgelist(self.g,
-                                   f"{self.graph_path}/{self.dataset}.txt")
-
-        print("\n")
+            TopicGraphBuilder(
+                dataset=dataset,
+                num_topics=num_topics,
+                doc_topic_threshold=doc_topic_threshold,
+                topic_topic_threshold=topic_topic_threshold,
+                use_word2vec=use_word2vec,
+                min_df=min_df,
+                max_df=max_df,
+            )
+        except Exception as exc:
+            print(f"Error building graph for {dataset}: {exc}")
 
 
-def main():
-    BuildGraph("mr")
-    BuildGraph("ohsumed")
-    BuildGraph("R52")
-    BuildGraph("R8")
-    BuildGraph("20ng")
+if __name__ == "__main__":
+    import argparse
 
+    parser = argparse.ArgumentParser(description="Build Document-Topic-Topic graphs for TopicGCN")
+    parser.add_argument("--dataset", type=str, default=None,
+                        help="Dataset name (default: build all supported datasets)")
+    parser.add_argument("--num_topics", type=int, default=50,
+                        help="Number of topics (default: 50)")
+    parser.add_argument("--doc_topic_threshold", type=float, default=0.02,
+                        help="Minimum θ_dk to keep document-topic edge (default: 0.02)")
+    parser.add_argument("--topic_topic_threshold", type=float, default=0.3,
+                        help="Minimum cosine similarity for topic-topic edge (default: 0.3)")
+    parser.add_argument("--no_word2vec", action="store_true",
+                        help="Disable Word2Vec embeddings (use topic-word distributions instead)")
+    parser.add_argument("--min_df", type=int, default=2,
+                        help="Minimum document frequency for LDA vocabulary (default: 2)")
+    parser.add_argument("--max_df", type=float, default=0.95,
+                        help="Maximum document frequency fraction for LDA vocabulary (default: 0.95)")
 
-if __name__ == '__main__':
-    main()
+    cli_args = parser.parse_args()
+
+    datasets = [cli_args.dataset] if cli_args.dataset else None
+    build_graphs(
+        datasets=datasets,
+        num_topics=cli_args.num_topics,
+        doc_topic_threshold=cli_args.doc_topic_threshold,
+        topic_topic_threshold=cli_args.topic_topic_threshold,
+        use_word2vec=not cli_args.no_word2vec,
+        min_df=cli_args.min_df,
+        max_df=cli_args.max_df,
+    )
